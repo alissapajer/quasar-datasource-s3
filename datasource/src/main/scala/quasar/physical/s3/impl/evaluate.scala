@@ -69,7 +69,7 @@ object evaluate {
           MonadResourceErr[F].raiseError(accessDeniedError(ResourcePath.leaf(file))))
 
       case Status.Ok =>
-        val back = res.body.through(recordSeenBytes[F](ref)) onFinalizeCase {
+        val current = res.body.through(recordSeenBytes[F](ref)) onFinalizeCase {
           case ExitCase.Error(e) =>
             ref.update(_.copy(continue = false)) >>
               MonadResourceErr[F].raiseError[Unit](ResourceError.connectionFailed(
@@ -84,17 +84,22 @@ object evaluate {
             ref.update(_.copy(continue = true))
         }
 
-        Resource.liftF(ref.get) flatMap { state =>
+        val next = Resource.liftF(ref.get) flatMap { state =>
           if (state.continue) {
             val newReq =
               req.withHeaders(Headers.of(
                 `Content-Range`(RangeUnit.Bytes, SubRange(state.seen, None), None)))
 
-            streamRequest[F](client, newReq, file, ref).map(back ++ _)
+            streamRequest[F](client, newReq, file, ref)
           } else {
-            Resource.pure[F, Stream[F, Byte]](back)
+            Resource.pure[F, Stream[F, Byte]](Stream.empty)
           }
         }
+
+        for {
+          cur <- Resource.pure[F, Stream[F, Byte]](current)
+          nxt <- next
+        } yield cur ++ nxt
 
       case other =>
         Resource.liftF(
