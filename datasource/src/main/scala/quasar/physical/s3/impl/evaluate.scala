@@ -22,19 +22,25 @@ import quasar.api.resource.ResourcePath
 import quasar.connector.{MonadResourceErr, ResourceError}
 import quasar.contrib.pathy._
 
-import cats.Monad
-import cats.effect.Resource
-import cats.syntax.applicative._
+import cats.Functor
+import cats.effect.{ExitCase, Resource, Sync}
+import cats.effect.concurrent.Ref
+import cats.implicits._
 
-import fs2.Stream
-import org.http4s.{Request, Status, Uri}
+import fs2.{Pipe, Stream}
+
+import org.http4s.{Headers, RangeUnit, Request, Status, Uri}
 import org.http4s.client._
+import org.http4s.headers.`Content-Range`
+import org.http4s.headers.Range.SubRange
+
 import pathy.Path
+
 import shims._
 
 object evaluate {
 
-  def apply[F[_]: Monad: MonadResourceErr](
+  def apply[F[_]: Sync: MonadResourceErr](
       client: Client[F], uri: Uri, file: AFile)
       : Resource[F, Stream[F, Byte]] = {
     // Convert the pathy Path to a POSIX path, dropping
@@ -44,27 +50,64 @@ object evaluate {
     val queryUri = appendPathS3Encoded(uri, objectPath)
     val request = Request[F](uri = queryUri)
 
-    streamRequest[F](client, request, file)
+    Resource.liftF(Ref.of[F, ByteState](ByteState(0, false))).flatMap(ref =>
+      streamRequest[F](client, request, file, ref))
   }
 
   ////
 
-  private def streamRequest[F[_]: Monad: MonadResourceErr](
-      client: Client[F], req: Request[F], file: AFile)
+  private def streamRequest[F[_]: Sync: MonadResourceErr](
+      client: Client[F], req: Request[F], file: AFile, ref: Ref[F, ByteState])
       : Resource[F, Stream[F, Byte]] =
-    client.run(req).evalMap[F, Stream[F, Byte]](res => res.status match {
+    client.run(req).flatMap[F, Stream[F, Byte]](res => res.status match {
       case Status.NotFound =>
-        MonadResourceErr[F].raiseError(ResourceError.pathNotFound(ResourcePath.leaf(file)))
+        Resource.liftF(
+          MonadResourceErr[F].raiseError(ResourceError.pathNotFound(ResourcePath.leaf(file))))
 
       case Status.Forbidden =>
-        MonadResourceErr[F].raiseError(accessDeniedError(ResourcePath.leaf(file)))
+        Resource.liftF(
+          MonadResourceErr[F].raiseError(accessDeniedError(ResourcePath.leaf(file))))
 
       case Status.Ok =>
-        res.body.pure[F]
+        val back = res.body.through(recordSeenBytes[F](ref)) onFinalizeCase {
+          case ExitCase.Error(e) =>
+            ref.update(_.copy(continue = false)) >>
+              MonadResourceErr[F].raiseError[Unit](ResourceError.connectionFailed(
+                ResourcePath.leaf(file),
+                Some("Unexpected response stream termination."),
+                Some(e)))
+
+          case ExitCase.Completed =>
+            ref.update(_.copy(continue = false))
+
+          case ExitCase.Canceled =>
+            ref.update(_.copy(continue = true))
+        }
+
+        Resource.liftF(ref.get) flatMap { state =>
+          if (state.continue) {
+            val newReq =
+              req.withHeaders(Headers.of(
+                `Content-Range`(RangeUnit.Bytes, SubRange(state.seen, None), None)))
+
+            streamRequest[F](client, newReq, file, ref).map(back ++ _)
+          } else {
+            Resource.pure[F, Stream[F, Byte]](back)
+          }
+        }
 
       case other =>
-        MonadResourceErr[F].raiseError(unexpectedStatusError(
-          ResourcePath.leaf(file),
-          other))
+        Resource.liftF(
+          MonadResourceErr[F].raiseError(unexpectedStatusError(
+            ResourcePath.leaf(file),
+            other)))
     })
+
+  private def recordSeenBytes[F[_]: Functor](ref: Ref[F, ByteState])
+      : Pipe[F, Byte, Byte] =
+    _.chunks
+      .evalTap(chunk => ref.getAndUpdate(s => s.copy(seen = s.seen + chunk.size)))
+      .flatMap(Stream.chunk(_))
+
+  private case class ByteState(seen: Long, continue: Boolean)
 }
