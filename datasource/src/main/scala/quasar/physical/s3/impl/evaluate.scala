@@ -66,12 +66,12 @@ object evaluate {
   private def streamRequest[F[_]: Sync: MonadResourceErr](
       client: Client[F], req: Request[F], file: AFile, ref: Ref[F, ByteState])
       : Resource[F, Stream[F, Byte]] =
-    client.run(req).flatMap[F, Stream[F, Byte]](res => res.status match {
+    client.run(req).evalMap[F, Stream[F, Byte]](res => res.status match {
       case Status.NotFound =>
-        Resource.liftF(MonadResourceErr[F].raiseError(ResourceError.pathNotFound(ResourcePath.leaf(file))))
+        MonadResourceErr[F].raiseError(ResourceError.pathNotFound(ResourcePath.leaf(file)))
 
       case Status.Forbidden =>
-        Resource.liftF(MonadResourceErr[F].raiseError(ResourceError.pathNotFound(ResourcePath.leaf(file))))
+        MonadResourceErr[F].raiseError(ResourceError.pathNotFound(ResourcePath.leaf(file)))
 
       case Status.Ok =>
         println(">>>>>>>>>> Status.Ok")
@@ -105,7 +105,7 @@ object evaluate {
             ref.update(_.copy(continue = false))
         }
 
-        val next: Resource[F, Stream[F, Byte]] = Resource.liftF(ref.get) flatMap { state =>
+        val next: F[Stream[F, Byte]] = ref.get map { state =>
           if (state.continue) {
             println(">>>>>>>>>> next - continuing: " + state.continue)
             println("next - state previous: " + state.previous)
@@ -114,21 +114,19 @@ object evaluate {
               req.withHeaders(Headers.of(
                 `Content-Range`(RangeUnit.Bytes, SubRange(state.current, None), None)))
 
-            streamRequest[F](client, newReq, file, ref)
+            val iterate = streamRequest[F](client, newReq, file, ref)
+            Stream.resource(iterate).flatten
           } else {
             println(">>>>>>>>>> next - not continuing: " + state.continue)
             println(">>>>>>>>>> next - state previous: " + state.previous)
             println(">>>>>>>>>> next - state current: " + state.current)
-            Resource.pure[F, Stream[F, Byte]](Stream.empty)
+            Stream.empty
           }
         }
 
-        for {
-          cur <- Resource.pure[F, Stream[F, Byte]](current)
-          nxt <- next
-        } yield cur ++ nxt
+        (current ++ Stream.force(next)).pure[F]
 
       case other =>
-        Resource.liftF(MonadResourceErr[F].raiseError(ResourceError.pathNotFound(ResourcePath.leaf(file))))
+        MonadResourceErr[F].raiseError(ResourceError.pathNotFound(ResourcePath.leaf(file)))
     })
 }
